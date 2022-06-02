@@ -4,7 +4,7 @@ Email: getsheng6456@gmail.com
 
 Current Affiliation: UESTC
 
-Future Affiliation:  Google Company/ Stanford University
+Future Affiliation: University of Southern California
 
 supervisor: Jin Qi
 
