@@ -1,4 +1,0 @@
-.vscode/
-.devcontainer/
-*.pyc
-.deployment/fastapi/model/
