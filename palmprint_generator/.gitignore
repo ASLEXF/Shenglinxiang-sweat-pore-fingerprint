@@ -1,0 +1,11 @@
+# OpenCV pack fetched by fetch_opencv.ps1
+third_party/
+
+# Build and run products
+deployment/*.exe
+deployment/*.dll
+deployment/*.obj
+deployment/output/
+
+# Test outputs
+tests/_out/
