@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 
@@ -42,8 +43,15 @@ cv::Point2d anat(double x, double y) { return anat(cv::Point2d(x, y)); }
 const cv::Point2d kPalmOutline[] = {
     {3.35, 18.7}, {2.35, 16.6}, {1.55, 14.0}, {2.45, 11.5}, {3.55, 9.35}, {4.70, 8.95},
     {6.20, 8.70}, {7.70, 8.95}, {9.20, 9.35}, {10.15, 9.85}, {10.75, 12.6}, {10.45, 15.6},
-    {9.45, 18.7}
+    {9.45, 18.7}, {6.40, 19.00}
 };
+
+// Shape of the outline softening, in cm of the model frame (art values).
+constexpr double kWebZoneDepth = 1.0;    // webs between fingers reach at most this far from the bases
+constexpr double kWebClose = 0.30;       // gaps narrower than twice this are filled inside that zone
+constexpr double kThumbWebClose = 0.55;  // rounding of the thumb-index web
+constexpr double kThumbBaseClose = 0.70; // rounding where the thumb's outer edge meets the thenar
+constexpr double kEdgeSmooth = 0.10;     // Gaussian sigma for the final corner rounding
 
 // Interdigital loop core and its triradius, cm below the gap between two finger bases.
 constexpr double kLoopCoreDepth = 0.8;
@@ -51,7 +59,11 @@ constexpr double kLoopDeltaDepth = 1.4;
 
 // Standard-hand measurements in the model frame with every shape factor at 1 (wrist crease
 // to middle fingertip, and breadth at the metacarpal heads).
-constexpr double kStandardHand = 18.2;
+// Fingers were drawn 7.2 cm (middle) and looked too short; this lengthens all five by a
+// user-requested 12%, a preference rather than a literature value. kStandardHand grows with
+// it so the population's hand length stays the target and the palm shrinks accordingly.
+constexpr double kFingerLengthScale = 1.12;
+constexpr double kStandardHand = 19.06;
 constexpr double kStandardBreadth = 8.1;
 
 // Centre of the hand-shape warp in the model frame (middle of the palm). The taper acts
@@ -82,6 +94,60 @@ cv::Point2d unit(const cv::Point2d& d) {
 double smoothstep(double t) {
     t = std::clamp(t, 0.0, 1.0);
     return t * t * (3.0 - 2.0 * t);
+}
+
+// Crease depth profile, tuned in the crease editor and exported from it:
+// depth = kCreaseDepth * cross(u) * along(t), in relief units (1 unit = -relief mm). u is the
+// distance from the centre line over the local crease radius (0..kCrossReach), t the position
+// along the whole stroke (0..1).
+constexpr double kCreaseDepth = 1.6;
+constexpr double kCrossReach = 2.5;
+const double kCrossPoints[][2] = {{0, 0.93}, {0.529, 0.767}, {0.978, 0.562}, {1.687, 0.288}, {2.5, 0.095}};
+const double kAlongPoints[][2] = {{0, 0}, {0.497, 0.6}, {1, 0}};
+constexpr int kProfileLut = 1024;
+
+// Monotone cubic (Fritsch-Carlson) through the points, sampled at kProfileLut steps over 0..x_end.
+template <size_t N>
+std::vector<float> profile_lut(const double (&pts)[N][2], double x_end) {
+    double h[N - 1], d[N - 1], m[N];
+    for (size_t i = 0; i + 1 < N; ++i) {
+        h[i] = pts[i + 1][0] - pts[i][0];
+        d[i] = (pts[i + 1][1] - pts[i][1]) / h[i];
+    }
+    auto edge = [](double h0, double h1, double d0, double d1) {
+        double v = ((2 * h0 + h1) * d0 - h0 * d1) / (h0 + h1);
+        if (v * d0 <= 0) return 0.0;
+        if (d0 * d1 <= 0 && std::abs(v) > 3 * std::abs(d0)) return 3 * d0;
+        return v;
+    };
+    for (size_t i = 1; i + 1 < N; ++i) {
+        if (d[i - 1] * d[i] <= 0) {
+            m[i] = 0;
+        } else {
+            const double w1 = 2 * h[i] + h[i - 1], w2 = h[i] + 2 * h[i - 1];
+            m[i] = (w1 + w2) / (w1 / d[i - 1] + w2 / d[i]);
+        }
+    }
+    m[0] = edge(h[0], h[1], d[0], d[1]);
+    m[N - 1] = edge(h[N - 2], h[N - 3], d[N - 2], d[N - 3]);
+    std::vector<float> lut(kProfileLut);
+    for (int i = 0; i < kProfileLut; ++i) {
+        const double x = double(i) / (kProfileLut - 1) * x_end;
+        double y;
+        if (x <= pts[0][0]) {
+            y = pts[0][1];
+        } else if (x >= pts[N - 1][0]) {
+            y = pts[N - 1][1];
+        } else {
+            size_t k = 0;
+            while (k + 2 < N && x > pts[k + 1][0]) ++k;
+            const double t = (x - pts[k][0]) / h[k], t2 = t * t, t3 = t2 * t;
+            y = (2 * t3 - 3 * t2 + 1) * pts[k][1] + (t3 - 2 * t2 + t) * h[k] * m[k]
+                + (-2 * t3 + 3 * t2) * pts[k + 1][1] + (t3 - t2) * h[k] * m[k + 1];
+        }
+        lut[i] = static_cast<float>(std::clamp(y, 0.0, 1.0));
+    }
+    return lut;
 }
 
 // splitmix64 finalizer. cv::RNG streams from nearby seeds start out correlated.
@@ -174,9 +240,29 @@ void PalmPrint::fill_ellipse(cv::Mat& mask, const cv::Point2d& center, double a,
     cv::fillPoly(mask, std::vector<std::vector<cv::Point>>{poly}, cv::Scalar(255), cv::LINE_8);
 }
 
+// Closed Catmull-Rom curve through kPalmOutline, so the corners of the control polygon come
+// out rounded. Design frame, cm.
+static std::vector<cv::Point2d> palm_outline_curve() {
+    const int n = static_cast<int>(sizeof(kPalmOutline) / sizeof(kPalmOutline[0]));
+    std::vector<cv::Point2d> pts;
+    for (int i = 0; i < n; ++i) {
+        const cv::Point2d& p0 = kPalmOutline[(i + n - 1) % n];
+        const cv::Point2d& p1 = kPalmOutline[i];
+        const cv::Point2d& p2 = kPalmOutline[(i + 1) % n];
+        const cv::Point2d& p3 = kPalmOutline[(i + 2) % n];
+        const int samples = std::max(2, cvCeil(norm2d(p2 - p1) / 0.05));
+        for (int k = 0; k < samples; ++k) {
+            const double t = static_cast<double>(k) / samples, t2 = t * t, t3 = t2 * t;
+            pts.push_back((p1 * 2.0 + (p2 - p0) * t + (p0 * 2.0 - p1 * 5.0 + p2 * 4.0 - p3) * t2
+                + (p1 * 3.0 - p0 - p2 * 3.0 + p3) * t3) * 0.5);
+        }
+    }
+    return pts;
+}
+
 std::vector<cv::Point> PalmPrint::palm_outline_px() const {
     std::vector<cv::Point> poly;
-    for (const auto& p : kPalmOutline) poly.push_back(to_px(anat(p)));
+    for (const auto& p : palm_outline_curve()) poly.push_back(to_px(anat(p)));
     return poly;
 }
 
@@ -243,8 +329,8 @@ std::vector<cv::Point2d> PalmPrint::catmull_rom(const std::vector<cv::Point2d>& 
 
 void PalmPrint::build_geometry() {
     const char* names[kFingers] = {"thumb", "index", "middle", "ring", "little"};
-    // Model frame. Middle finger 7.2 cm from its base crease (literature about 6.8/7.5 cm
-    // for women/men); finger breadths 1.4-2.4 cm.
+    // Model frame. Middle finger 7.2 cm * kFingerLengthScale from its base; finger breadths
+    // 1.4-2.4 cm.
     const cv::Point2d bases[kFingers] = {
         anat(3.15, 12.55), anat(4.55, 9.15), anat(6.20, 8.82), anat(7.75, 9.05), anat(9.15, 9.48)
     };
@@ -278,7 +364,7 @@ void PalmPrint::build_geometry() {
     for (int i = 0; i < kFingers; ++i) finger_len[i] = shape.uniform(0.95, 1.05);
 
     // Ridge period and pore spacing follow sex (women have finer ridges and denser pores).
-    base_period_ = std::max(kMinPeriodPx, px(kRidgePeriodCm * pop_->ridge_scale[sex_]));
+    base_period_ = std::max(kMinPeriodPx, px(kRidgePeriodCm * pop_->ridge_scale[sex_] * ridge_user_scale_));
     period_min_ = base_period_ * 0.85;
     period_max_ = base_period_ * 1.5;
     pore_spacing_cm_ = pop_->pore_cell[sex_];
@@ -296,7 +382,7 @@ void PalmPrint::build_geometry() {
         f.axis = axes[i] + rng_.uniform(-0.04, 0.04);
         // Fingers fan out around the middle finger's axis; the thumb swings about its base.
         f.axis = i == 0 ? f.axis + thumb_turn : axes[2] + (f.axis - axes[2]) * spread;
-        f.length = lengths[i] * rng_.uniform(0.96, 1.04) * finger_len[i];
+        f.length = lengths[i] * kFingerLengthScale * rng_.uniform(0.96, 1.04) * finger_len[i];
         f.width = widths[i] * rng_.uniform(0.96, 1.04);
         f.segments = segments[i];
         if (f.segments == 2) {
@@ -398,7 +484,7 @@ void PalmPrint::build_geometry() {
         bounds_.height = std::max(bounds_.height, p.y);
     };
     bounds_ = cv::Rect2d(1e9, 1e9, -1e9, -1e9);
-    for (const auto& p : kPalmOutline) consider(warp(anat(p)));
+    for (const auto& p : palm_outline_curve()) consider(warp(anat(p)));
     for (const auto& f : fingers_) {
         consider(warp(f.base));
         consider(warp(f.base + f.axis_dir * f.length));
@@ -460,7 +546,7 @@ void PalmPrint::add_tapered(const cv::Point2d& a, const cv::Point2d& b, const cv
         double t = curve.size() == 1 ? 0.0 : static_cast<double>(i) / (curve.size() - 1);
         double u = 1.0 - t;
         double width = u * u * width_start + 2 * u * t * width_mid + t * t * width_end;
-        width *= 1.0 + 0.22 * std::sin(t * 16.0 + phase);
+        width *= (1.0 + 0.22 * std::sin(t * 16.0 + phase)) * crease_user_scale_;
         int radius = std::max(1, cvRound(px_len(width) * 0.5));
         max_radius = std::max(max_radius, radius);
         stroke.pts.push_back(to_px(curve[i]));
@@ -486,7 +572,7 @@ void PalmPrint::add_curve(const std::vector<cv::Point2d>& ctrl, double width_sta
         double t = arc[i] / total;
         double u = 1.0 - t;
         double width = u * u * width_start + 2 * u * t * width_mid + t * t * width_end;
-        width *= 1.0 + 0.22 * std::sin(arc[i] * 2.7 + phase);
+        width *= (1.0 + 0.22 * std::sin(arc[i] * 2.7 + phase)) * crease_user_scale_;
         int radius = std::max(1, cvRound(px_len(width) * 0.5));
         max_radius = std::max(max_radius, radius);
         stroke.pts.push_back(to_px(curve[i]));
@@ -527,34 +613,49 @@ void PalmPrint::add_principal_lines(cv::RNG& rng) {
     const Finger& thumb = fingers_[0];
     const Finger& index = fingers_[1];
     const cv::Point2d radial_top = index.base - index.across * (index.width * 0.5);
-    cv::Point2d radial_web = anat(3.02, 10.39);
-    {
-        const cv::Point2d e0 = anat(2.45, 11.5), e1 = anat(3.55, 9.35);
-        const cv::Point2d q = thumb.base + thumb.across * (thumb.width * 0.5);
-        const cv::Point2d d = thumb.axis_dir, e = e1 - e0;
-        const double den = d.x * e.y - d.y * e.x;
-        if (std::abs(den) > 1e-9) {
-            const double r = (d.x * (q.y - e0.y) - d.y * (q.x - e0.x)) / den;
-            if (r >= 0 && r <= 1) radial_web = e0 + e * r;
-        }
-    }
+    const cv::Point2d radial_web = thumb_web();
     cv::Point2d radial_out = unit(rot90(radial_web - radial_top));
     if (radial_out.dot(radial_top - anat(6.2, 13.5)) < 0) radial_out = radial_out * -1.0;
-    auto radial_at = [&](double t) { return radial_top + (radial_web - radial_top) * t + radial_out * 0.25; };
-
-    const bool simian = rng.uniform(0.0, 100.0) < pop_->simian;
-    const bool separate = !simian && rng.uniform(0.0, 100.0) < pop_->separate;
-    const cv::Point2d life_start = jitter(radial_at(separate ? 0.68 : 0.45), 0.05);
-    std::string summary;
     auto label_at = [&](const cv::Point2d& p) {
         cv::Point q = to_px(p);
         if (q.x < 0 || q.y < 0 || q.x >= labels_.cols || q.y >= labels_.rows) return 0;
         return static_cast<int>(labels_.at<uint8_t>(q));
     };
+    // The outline is a curve now and the thumb web is rounded, so the radial edge can lie
+    // beyond the chord; push out until the point, and the jitter around it, is clear of the
+    // hand and the stroke still enters from outside.
+    auto radial_at = [&](double t) {
+        const cv::Point2d from = radial_top + (radial_web - radial_top) * t;
+        double depth = 0.25;
+        while (depth < 1.5 && label_at(from + radial_out * (depth - 0.12)) != 0) depth += 0.05;
+        return from + radial_out * depth;
+    };
+
+    const bool simian = rng.uniform(0.0, 100.0) < pop_->simian;
+    const bool separate = !simian && rng.uniform(0.0, 100.0) < pop_->separate;
+    // The jitter is drawn once so the random sequence does not depend on the search below.
+    const double life_t = separate ? 0.68 : 0.45;
+    const cv::Point2d life_jitter = jitter(cv::Point2d(0, 0), 0.05);
+    cv::Point2d life_start = radial_at(life_t) + life_jitter;
+    {
+        // The start has to be outside the hand and the stroke's second point (0.5, 0.8 further
+        // on) on the palm. Next to the rounded thumb web either can fail; slide the start
+        // along the radial edge towards the index base.
+        auto on_finger = [&](const cv::Point2d& p) {
+            const int l = label_at(p);
+            return l != 0 && finger_of(l) != kPalm;
+        };
+        auto blocked = [&](const cv::Point2d& s) {
+            return label_at(s) != 0 || on_finger(s + cv::Point2d(0.5, 0.8)) || on_finger(s + cv::Point2d(0.58, 0.88)) ||
+                on_finger(s + cv::Point2d(0.42, 0.72));
+        };
+        for (double t = life_t - 0.05; t > 0.05 && blocked(life_start); t -= 0.05) life_start = radial_at(t) + life_jitter;
+    }
+    std::string summary;
     auto check_start = [&](const cv::Point2d& start, const cv::Point2d& next, const char* name) {
         const int a = label_at(start), b = label_at(next);
         if (a != 0 || (b != 0 && finger_of(b) != kPalm))
-            std::cout << "warning: " << name << " starts on the hand or runs onto a finger" << std::endl;
+            std::cout << "warning: " << name << " starts on the hand or runs onto a finger (labels " << a << ", " << b << ")" << std::endl;
     };
 
     // Life line (thenar crease): arcs around the thenar eminence, widest about a third of
@@ -692,6 +793,109 @@ void PalmPrint::add_joint_crease(const Finger& finger, double along, double widt
     add_tapered(a, bow, c, width_cm * 0.75, width_cm, width_cm * 0.7);
 }
 
+// Where the thumb's ulnar edge meets the palm's radial edge (model frame, cm).
+cv::Point2d PalmPrint::thumb_web() const {
+    const Finger& thumb = fingers_[0];
+    cv::Point2d web = anat(3.02, 10.39);
+    const cv::Point2d e0 = anat(2.45, 11.5), e1 = anat(3.55, 9.35);
+    const cv::Point2d q = thumb.base + thumb.across * (thumb.width * 0.5);
+    const cv::Point2d d = thumb.axis_dir, e = e1 - e0;
+    const double den = d.x * e.y - d.y * e.x;
+    if (std::abs(den) > 1e-9) {
+        const double r = (d.x * (q.y - e0.y) - d.y * (q.x - e0.x)) / den;
+        if (r >= 0 && r <= 1) web = e0 + e * r;
+    }
+    return web;
+}
+
+// Natural hand outline from the stacked shapes: webs between the fingers, rounded valleys at
+// the thumb, then a light blur-and-threshold that takes the corners and steps off the edge.
+// Labels are only ever copied from neighbours (never blended), so they stay valid.
+void PalmPrint::soften_outline() {
+    cv::Mat mask;
+    cv::compare(labels_, 0, mask, cv::CMP_GT);
+
+    // Close gaps narrower than 2 * radius, but only inside `zone`. The pixels this adds belong
+    // to the palm (never to a finger), so they get `label`.
+    auto close_in = [&](const cv::Mat& zone, double radius_cm, int label) {
+        const cv::Rect box = cv::boundingRect(zone) & cv::Rect(0, 0, mask.cols, mask.rows);
+        if (box.empty()) return;
+        const int r = std::max(2, cvRound(px_len(radius_cm)));
+        const cv::Rect roi = cv::Rect(box.x - r - 2, box.y - r - 2, box.width + 2 * r + 4, box.height + 2 * r + 4)
+            & cv::Rect(0, 0, mask.cols, mask.rows);
+        cv::Mat closed;
+        cv::morphologyEx(mask(roi), closed, cv::MORPH_CLOSE,
+            cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(2 * r + 1, 2 * r + 1)));
+        cv::bitwise_and(closed, zone(roi), closed);
+        cv::Mat fresh = closed & ~mask(roi);
+        labels_(roi).setTo(label, fresh);
+        cv::bitwise_or(mask(roi), closed, mask(roi));
+    };
+
+    // Webs: strip between the bases of each pair of neighbouring fingers, kWebZoneDepth deep.
+    cv::Mat web_zone = cv::Mat::zeros(labels_.size(), CV_8U);
+    for (int i = 1; i + 1 < kFingers; ++i) {
+        const Finger& a = fingers_[i];
+        const Finger& b = fingers_[i + 1];
+        const cv::Point2d dir = unit(a.axis_dir + b.axis_dir);
+        const cv::Point2d pa = a.base - a.axis_dir * 0.3, pb = b.base - b.axis_dir * 0.3;
+        const cv::Point quad[4] = {to_px(pa), to_px(pb), to_px(pb + dir * kWebZoneDepth), to_px(pa + dir * kWebZoneDepth)};
+        cv::fillConvexPoly(web_zone, quad, 4, cv::Scalar(255), cv::LINE_8);
+    }
+    close_in(web_zone, kWebClose, pack(INTERDIGITAL, kPalm));
+
+    // Thumb-index web, and the place where the thumb's outer edge runs into the thenar.
+    const Finger& thumb = fingers_[0];
+    cv::Mat thumb_zone = cv::Mat::zeros(labels_.size(), CV_8U);
+    cv::circle(thumb_zone, to_px(thumb_web()), std::max(2, cvRound(px_len(1.5))), cv::Scalar(255), cv::FILLED, cv::LINE_8);
+    close_in(thumb_zone, kThumbWebClose, pack(THENAR, kPalm));
+    {
+        const cv::Point2d palm_mid = anat(6.2, 13.5);
+        cv::Point2d out_dir = thumb.across;
+        if (out_dir.dot(thumb.base - palm_mid) < 0) out_dir = out_dir * -1.0;
+        const cv::Point2d centre = thumb.base + out_dir * (thumb.width * 0.5) - thumb.axis_dir * 0.4;
+        cv::Mat base_zone = cv::Mat::zeros(labels_.size(), CV_8U);
+        cv::circle(base_zone, to_px(centre), std::max(2, cvRound(px_len(1.4))), cv::Scalar(255), cv::FILLED, cv::LINE_8);
+        close_in(base_zone, kThumbBaseClose, pack(THENAR, kPalm));
+    }
+
+    // Take the corners and one-pixel steps off the outline. Straight edges stay where they are.
+    cv::Mat soft;
+    mask.convertTo(soft, CV_32F, 1.0 / 255);
+    cv::GaussianBlur(soft, soft, cv::Size(0, 0), std::max(1.0, px_len(kEdgeSmooth)));
+    cv::compare(soft, 0.5f, mask, cv::CMP_GE);
+    soft.release();
+
+    labels_.setTo(0, ~mask);
+    cv::Mat known;
+    cv::compare(labels_, 0, known, cv::CMP_GT);
+    cv::Mat added = mask & ~known;
+    if (cv::countNonZero(added) == 0) return;
+
+    // New pixels take the label of the nearest old one. distanceTransform numbers the zero
+    // pixels 1, 2, ... in raster order; `values` lists the labels in the same order.
+    cv::Mat src(labels_.size(), CV_8U, cv::Scalar(255)), dist, nearest;
+    src.setTo(0, known);
+    cv::distanceTransform(src, dist, nearest, cv::DIST_L2, 5, cv::DIST_LABEL_PIXEL);
+    dist.release();
+    std::vector<uint8_t> values;
+    values.reserve(static_cast<size_t>(cv::countNonZero(known)) + 1);
+    values.push_back(0);
+    for (int y = 0; y < labels_.rows; ++y) {
+        const uint8_t* lab = labels_.ptr<uint8_t>(y);
+        const uint8_t* kn = known.ptr<uint8_t>(y);
+        for (int x = 0; x < labels_.cols; ++x)
+            if (kn[x]) values.push_back(lab[x]);
+    }
+    for (int y = 0; y < labels_.rows; ++y) {
+        const uint8_t* ad = added.ptr<uint8_t>(y);
+        const int* near_idx = nearest.ptr<int>(y);
+        uint8_t* lab = labels_.ptr<uint8_t>(y);
+        for (int x = 0; x < labels_.cols; ++x)
+            if (ad[x] && near_idx[x] > 0 && near_idx[x] < static_cast<int>(values.size())) lab[x] = values[near_idx[x]];
+    }
+}
+
 void PalmPrint::rasterize() {
     const int width = std::max(1, cvRound(bounds_.width * scale_) + margin_ * 2);
     const int height = std::max(1, cvRound(bounds_.height * scale_) + margin_ * 2);
@@ -720,7 +924,7 @@ void PalmPrint::rasterize() {
     fill_ellipse(shape, {3.15, 14.25}, 2.25, 3.15, 68);
     paint_palm(THENAR);
     const cv::Point wrist_px[] = {
-        to_px(anat(3.15, 16.7)), to_px(anat(9.55, 16.7)), to_px(anat(9.45, 18.7)), to_px(anat(3.35, 18.7))
+        to_px(anat(3.15, 16.7)), to_px(anat(9.55, 16.7)), to_px(anat(9.45, 19.4)), to_px(anat(3.35, 19.4))
     };
     cv::fillConvexPoly(shape, wrist_px, 4, cv::Scalar(255), cv::LINE_8);
     paint_palm(WRIST);
@@ -752,6 +956,8 @@ void PalmPrint::rasterize() {
             add_joint_crease(f, f.seg_at[1] + 0.12, 0.17, rng_.uniform(-0.08, 0.08));
         }
     }
+
+    soften_outline();
 
     // Palm creases draw from their own stream so editing them leaves the ridge noise alone.
     cv::RNG lines(stream_seed(0));
@@ -1087,13 +1293,17 @@ void PalmPrint::composite() {
     // 0.028-0.031 cm all round to 6 px), so cell edges are floor(i * cell).
     const double cell = std::max(2.0, px(pore_spacing_cm_));
     auto edge = [&](int i) { return static_cast<int>(std::floor(i * cell)); };
-    const int radius = base_period_ >= 8 ? 1 : 0;
+    // Pore radius is 1 px (sometimes 2) at 500 dpi, about 0.05-0.1 mm; scale it above that so
+    // pores keep their real size at 1000 dpi and beyond.
+    const int grow = std::max(1, cvRound(dpi_ / 500.0));
+    const int radius = base_period_ >= 8 ? grow : 0;
     const float center = static_cast<float>(std::max(1.0, base_period_ * 0.2));
     const int gx = cvCeil(ink.cols / cell), gy = cvCeil(ink.rows / cell);
     std::vector<cv::Point> placed(static_cast<size_t>(gx) * gy, cv::Point(-1, -1));
     const double min_gap2 = std::pow(0.6 * cell, 2);
     int pores = 0, distal_pores = 0;
-    for (int cy = 0; cy < gy; ++cy) {
+    pores_ = cv::Mat::zeros(labels_.size(), CV_8U);
+    for (int cy = 0; cy < (with_pores_ ? gy : 0); ++cy) {
         for (int cx = 0; cx < gx; ++cx) {
             // A random pixel near the ridge centre, not the exact centre, so pores do not
             // line up like stitching.
@@ -1124,10 +1334,14 @@ void PalmPrint::composite() {
             placed[static_cast<size_t>(cy) * gx + cx] = best;
             ++pores;
             if (region_of(labels_.at<uint8_t>(best)) == DISTAL) ++distal_pores;
-            if (radius == 0)
+            if (radius == 0) {
                 ink.at<float>(best) *= 0.15f;
-            else
-                cv::circle(ink, best, radius + (rng_.uniform(0, 4) == 0 ? 1 : 0), cv::Scalar(0), cv::FILLED, cv::LINE_8);
+                pores_.at<uint8_t>(best) = 255;
+            } else {
+                const int r = radius + (rng_.uniform(0, 4) == 0 ? grow : 0);
+                cv::circle(ink, best, r, cv::Scalar(0), cv::FILLED, cv::LINE_8);
+                cv::circle(pores_, best, r, cv::Scalar(255), cv::FILLED, cv::LINE_8);
+            }
         }
     }
     {
@@ -1146,7 +1360,133 @@ void PalmPrint::composite() {
 
     ink.convertTo(image_, CV_8U, -235.0, 255.0);
 
+    // Relief for the height map, built from geometry only (not from the ink image, whose
+    // grain, blotches and ragged ends are print artefacts). Ridge crest +0.5 and furrow -0.5
+    // at full strength; creases are cut to -1 and take the ridges with them; the ridge
+    // amplitude, crease depth and pits fade to zero at the hand edge so the outline has no
+    // cliff. Ridges differ by region: fingertip pads are the highest with sharp crests, the
+    // palm is lower, with rounder crests and a slow undulation of height.
+    {
+        // Ridge strength per region (art values), blended over ~0.25 cm so the palm areas
+        // do not meet in steps.
+        static const float kRegionRelief[9] = {0.f, 1.0f, 0.85f, 0.8f, 0.65f, 0.55f, 0.55f, 0.5f, 0.5f};
+        cv::Mat strength(labels_.size(), CV_32F, cv::Scalar(0));
+        cv::Mat covered(labels_.size(), CV_32F, cv::Scalar(0));
+        for (int y = 0; y < labels_.rows; ++y) {
+            const uint8_t* lab = labels_.ptr<uint8_t>(y);
+            float* sr = strength.ptr<float>(y);
+            float* cov = covered.ptr<float>(y);
+            for (int x = 0; x < labels_.cols; ++x) {
+                if (!lab[x]) continue;
+                sr[x] = kRegionRelief[std::clamp(region_of(lab[x]), 0, 8)];
+                cov[x] = 1.f;
+            }
+        }
+        const double region_sigma = std::max(1.0, px(0.25));
+        cv::GaussianBlur(strength, strength, cv::Size(0, 0), region_sigma);
+        cv::GaussianBlur(covered, covered, cv::Size(0, 0), region_sigma);
+        strength /= cv::max(covered, 1e-3);
+
+        cv::Mat sharp, soft;
+        cv::GaussianBlur(ridges_, sharp, cv::Size(0, 0), 0.15 * base_period_);
+        cv::GaussianBlur(ridges_, soft, cv::Size(0, 0), 0.22 * base_period_);
+
+        // Slow variation of palm height: its own random stream, so nothing else shifts.
+        cv::RNG relief_rng(stream_seed(5));
+        const int cell = std::max(8, cvRound(px(0.5)));
+        cv::Mat swell(labels_.rows / cell + 3, labels_.cols / cell + 3, CV_32F), lift(swell.size(), CV_32F);
+        relief_rng.fill(swell, cv::RNG::UNIFORM, -1.0, 1.0);
+        relief_rng.fill(lift, cv::RNG::UNIFORM, -1.0, 1.0);
+        cv::resize(swell, swell, labels_.size(), 0, 0, cv::INTER_CUBIC);
+        cv::resize(lift, lift, labels_.size(), 0, 0, cv::INTER_CUBIC);
+
+        // Crease depth from the centre lines: per pixel the nearest segment (distance over the
+        // local radius, position along the stroke), then the editor's two profile curves. Distance
+        // to the segment, not to the nearest sample, so thin creases stay continuous.
+        cv::Mat groove(labels_.size(), CV_32F, cv::Scalar(0));
+        {
+            const std::vector<float> lut_cross = profile_lut(kCrossPoints, kCrossReach);
+            const std::vector<float> lut_along = profile_lut(kAlongPoints, 1.0);
+            cv::Mat near_u(labels_.size(), CV_32F, cv::Scalar(1e9)), near_t(labels_.size(), CV_32F, cv::Scalar(0));
+            for (const Stroke& stroke : strokes_) {
+                const size_t n = stroke.pts.size();
+                if (n < 2) continue;
+                std::vector<double> arc(n, 0.0);
+                for (size_t i = 1; i < n; ++i)
+                    arc[i] = arc[i - 1] + std::hypot(double(stroke.pts[i].x - stroke.pts[i - 1].x), double(stroke.pts[i].y - stroke.pts[i - 1].y));
+                const double total = std::max(1.0, arc.back());
+                for (size_t i = 0; i + 1 < n; ++i) {
+                    const double ax = stroke.pts[i].x, ay = stroke.pts[i].y, bx = stroke.pts[i + 1].x, by = stroke.pts[i + 1].y;
+                    const double ar = std::max(1, stroke.radii[i]), br = std::max(1, stroke.radii[i + 1]);
+                    const double vx = bx - ax, vy = by - ay, vv = std::max(1e-9, vx * vx + vy * vy);
+                    const int reach = static_cast<int>(std::ceil(std::max(ar, br) * kCrossReach)) + 1;
+                    const int xa = std::max(0, static_cast<int>(std::floor(std::min(ax, bx))) - reach);
+                    const int xb = std::min(labels_.cols - 1, static_cast<int>(std::ceil(std::max(ax, bx))) + reach);
+                    const int ya = std::max(0, static_cast<int>(std::floor(std::min(ay, by))) - reach);
+                    const int yb = std::min(labels_.rows - 1, static_cast<int>(std::ceil(std::max(ay, by))) + reach);
+                    for (int y = ya; y <= yb; ++y) {
+                        float* nu = near_u.ptr<float>(y);
+                        float* nt = near_t.ptr<float>(y);
+                        for (int x = xa; x <= xb; ++x) {
+                            const double s = std::clamp(((x - ax) * vx + (y - ay) * vy) / vv, 0.0, 1.0);
+                            const double r = ar + (br - ar) * s;
+                            const double d = std::hypot(x - (ax + vx * s), y - (ay + vy * s)) / r;
+                            if (d < nu[x]) {
+                                nu[x] = static_cast<float>(d);
+                                nt[x] = static_cast<float>((arc[i] + (arc[i + 1] - arc[i]) * s) / total);
+                            }
+                        }
+                    }
+                }
+            }
+            for (int y = 0; y < labels_.rows; ++y) {
+                const float* nu = near_u.ptr<float>(y);
+                const float* nt = near_t.ptr<float>(y);
+                float* gr = groove.ptr<float>(y);
+                for (int x = 0; x < labels_.cols; ++x) {
+                    if (nu[x] >= kCrossReach) continue;
+                    const float c = lut_cross[static_cast<int>(nu[x] / kCrossReach * (kProfileLut - 1))];
+                    const float a = lut_along[static_cast<int>(std::clamp(nt[x], 0.f, 1.f) * (kProfileLut - 1))];
+                    gr[x] = static_cast<float>(kCreaseDepth) * c * a;
+                }
+            }
+        }
+        cv::Mat pit;
+        pores_.convertTo(pit, CV_32F, 1.0 / 255);
+        cv::GaussianBlur(pit, pit, cv::Size(0, 0), 0.7);
+        pit = cv::min(pit * 2.0, 1.0);
+        height_ = cv::Mat::zeros(labels_.size(), CV_32F);
+        for (int y = 0; y < labels_.rows; ++y) {
+            const uchar* h = hand.ptr<uchar>(y);
+            const float* sh = sharp.ptr<float>(y);
+            const float* so = soft.ptr<float>(y);
+            const float* st = strength.ptr<float>(y);
+            const float* sw = swell.ptr<float>(y);
+            const float* lf = lift.ptr<float>(y);
+            const float* g = groove.ptr<float>(y);
+            const float* p = pit.ptr<float>(y);
+            const float* e = edge_dist.ptr<float>(y);
+            float* out = height_.ptr<float>(y);
+            for (int x = 0; x < labels_.cols; ++x) {
+                if (!h[x]) continue;
+                const double amp = smoothstep(e[x] / fade);
+                const double w = st[x];
+                const double palmness = std::clamp((1.0 - w) / 0.45, 0.0, 1.0);
+                const double crest = std::clamp<double>((1.0 - palmness) * sh[x] + palmness * so[x], -1.0, 1.0);
+                const double ridge = 0.5 * crest * w * (1.0 + 0.3 * palmness * sw[x]) + 0.12 * palmness * lf[x];
+                // Creases that run off the outline fade out with the ridges instead of ending in a cliff.
+                const double cut = g[x] * amp;
+                double v = amp * (1.0 - std::min(cut, 1.0)) * ridge - cut;
+                const double pit_depth = p[x] * amp;
+                v = v * (1.0 - pit_depth) - 0.6 * w * pit_depth;
+                out[x] = static_cast<float>(v);
+            }
+        }
+    }
+
     if (right_hand_) {
+        cv::flip(pores_, pores_, 1);
+        cv::flip(height_, height_, 1);
         cv::flip(image_, image_, 1);
         cv::flip(labels_, labels_, 1);
         cv::flip(creases_, creases_, 1);
@@ -1162,10 +1502,10 @@ void PalmPrint::generate() {
               << " population=" << pop_->name << std::endl;
     build_geometry();
     std::cout << "ridge period=" << base_period_ << " px" << std::endl;
-    // Pores sit on ridge centres; below about 8 px per ridge (roughly 420 dpi) there are too
+    // Pores sit on ridge centres; below about 8 px per ridge (roughly 600 dpi at the default ridge scale) there are too
     // few centre pixels and fingertip pore density drops to about half the real value.
     if (base_period_ < 8)
-        std::cout << "note: at " << dpi_ << " dpi pores come out at about half the real density; use -dpi 500 for pore work" << std::endl;
+        std::cout << "note: at " << dpi_ << " dpi pores come out at about half the real density; use -dpi 1000 for pore work" << std::endl;
     rasterize();
     std::cout << "canvas " << labels_.cols << "x" << labels_.rows << std::endl;
     std::cout << "shape" << shape_summary_ << std::endl;
@@ -1228,4 +1568,94 @@ bool PalmPrint::save_layers(const std::string& directory) const {
     ok = cv::imwrite(directory + "/creases.png", creases_) && ok;
     ok = cv::imwrite(directory + "/palmprint.jpg", image_) && ok;
     return ok;
+}
+
+bool PalmPrint::save_height(const std::string& path, double relief_mm) const {
+    if (height_.empty()) return false;
+    std::filesystem::path file(path);
+    if (file.has_parent_path()) std::filesystem::create_directories(file.parent_path());
+    // Relief units -1..+1 map to 0..65535, so flat ground (and everything outside the hand)
+    // is mid grey 32768 and 65535 is +relief_mm. The deepest crease is about -0.9 with the
+    // current profile; anything deeper than -1 would clip.
+    cv::Mat height16;
+    height_.convertTo(height16, CV_16U, 32767.5, 32767.5);
+    const double mm_px = 25.4 / dpi_;
+    std::printf("height %dx%d px, %.2f x %.2f cm, %.3f mm/px; relief %.3f mm crest-to-furrow; 0..65535 = -%.3f..+%.3f mm (flat = 32768)\n",
+        height16.cols, height16.rows, height16.cols * mm_px / 10.0, height16.rows * mm_px / 10.0, mm_px,
+        relief_mm, relief_mm, relief_mm);
+    return cv::imwrite(path, height16);
+}
+
+bool PalmPrint::dump_creases(const std::string& path) const {
+    if (labels_.empty()) return false;
+    std::filesystem::path file(path);
+    if (file.has_parent_path()) std::filesystem::create_directories(file.parent_path());
+    std::ofstream out(path);
+    if (!out) return false;
+    const int full_w = labels_.cols;
+    // Strokes are kept in left-hand image coordinates; mirror them for -right so they match the image.
+    auto fx = [&](int x) { return right_hand_ ? full_w - 1 - x : x; };
+
+    // Only the palm (plus a little margin) is written, so a 600 dpi dump stays small enough for a
+    // browser. Finger joint creases that reach into this window are included.
+    int x0 = labels_.cols, y0 = labels_.rows, x1 = -1, y1 = -1;
+    for (int y = 0; y < labels_.rows; ++y) {
+        const uint8_t* lab = labels_.ptr<uint8_t>(y);
+        for (int x = 0; x < labels_.cols; ++x)
+            if (lab[x] && finger_of(lab[x]) == kPalm) {
+                x0 = std::min(x0, x); x1 = std::max(x1, x);
+                y0 = std::min(y0, y); y1 = std::max(y1, y);
+            }
+    }
+    if (x1 < 0) return false;
+    const int pad = std::max(2, cvRound(px(0.3)));
+    x0 = std::max(0, x0 - pad); y0 = std::max(0, y0 - pad);
+    x1 = std::min(labels_.cols - 1, x1 + pad); y1 = std::min(labels_.rows - 1, y1 + pad);
+    const int width = x1 - x0 + 1, height = y1 - y0 + 1;
+
+    cv::Mat mask;
+    cv::compare(labels_, 0, mask, cv::CMP_GT);
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    size_t biggest = 0;
+    for (size_t i = 1; i < contours.size(); ++i)
+        if (contours[i].size() > contours[biggest].size()) biggest = i;
+    std::vector<cv::Point> outline;
+    if (!contours.empty()) cv::approxPolyDP(contours[biggest], outline, 1.5, true);
+
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "{\"dpi\":%d,\"width\":%d,\"height\":%d,\"px_per_cm\":%.4f,", dpi_, width, height, scale_);
+    out << buf << "\"outline\":[";
+    for (size_t i = 0; i < outline.size(); ++i) {
+        std::snprintf(buf, sizeof(buf), "%s[%d,%d]", i ? "," : "", outline[i].x - x0, outline[i].y - y0);
+        out << buf;
+    }
+    out << "],\"strokes\":[";
+    bool first_stroke = true;
+    for (const Stroke& stroke : strokes_) {
+        if (stroke.pts.size() < 2) continue;
+        // Position along the whole stroke (0..1), so cutting the window does not distort it.
+        std::vector<double> arc(stroke.pts.size(), 0.0);
+        for (size_t i = 1; i < stroke.pts.size(); ++i)
+            arc[i] = arc[i - 1] + std::hypot(double(stroke.pts[i].x - stroke.pts[i - 1].x), double(stroke.pts[i].y - stroke.pts[i - 1].y));
+        const double total = std::max(1.0, arc.back());
+        std::string body;
+        auto flush = [&]() {
+            if (body.empty()) return;
+            out << (first_stroke ? "" : ",") << "{\"ragged\":" << stroke.ragged << ",\"pts\":[" << body << "]}";
+            first_stroke = false;
+            body.clear();
+        };
+        // Every other sample is enough to redraw the line (the reader joins them with segments);
+        // a stroke that leaves the window and comes back is written as separate pieces.
+        for (size_t i = 0; i < stroke.pts.size(); i += 2) {
+            const int x = fx(stroke.pts[i].x) - x0, y = stroke.pts[i].y - y0;
+            if (x < -8 || y < -8 || x > width + 8 || y > height + 8) { flush(); continue; }
+            std::snprintf(buf, sizeof(buf), "%s[%d,%d,%d,%.4f]", body.empty() ? "" : ",", x, y, stroke.radii[i], arc[i] / total);
+            body += buf;
+        }
+        flush();
+    }
+    out << "]}";
+    return static_cast<bool>(out);
 }

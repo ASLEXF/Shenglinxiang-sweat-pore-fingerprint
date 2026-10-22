@@ -14,9 +14,23 @@ class PalmPrint {
 public:
     PalmPrint(int dpi, unsigned seed, bool right_hand, const Population& population);
 
+    // Multiplies the ridge period (1 = the preset's own value, default 0.8). Call before generate().
+    void set_ridge_scale(double scale) { ridge_user_scale_ = scale; }
+    // Multiplies the width of every crease (palm lines, finger joints, wrist); default 0.5. Call before generate().
+    void set_crease_scale(double scale) { crease_user_scale_ = scale; }
+
+    // Pores are on by default; off leaves the ridges unbroken in both the image and the height map.
+    void set_pores(bool on) { with_pores_ = on; }
+
     void generate();
     bool save(const std::string& path) const;
     bool save_layers(const std::string& directory) const;
+
+    // Height map for a 3D hand model: 16 bit grey, mid grey 32768 = flat, relief_mm is the
+    // ridge crest-to-furrow height. Creases are cut half a relief_mm below the furrows.
+    bool save_height(const std::string& path, double relief_mm) const;
+    // Crease centre lines and radii (px) plus the hand outline, as JSON for the depth-profile editor.
+    bool dump_creases(const std::string& path) const;
 
     const cv::Mat& image() const { return image_; }
 
@@ -93,6 +107,8 @@ private:
 
     void build_geometry();
     void rasterize();
+    void soften_outline();
+    cv::Point2d thumb_web() const;
     void build_orientation();
     void build_period();
     void render_ridges();
@@ -147,6 +163,9 @@ private:
     std::string shape_summary_;
 
     // Ridge period in pixels. Never below 5 px so a ridge and a furrow both stay visible.
+    double ridge_user_scale_ = 0.8;
+    double crease_user_scale_ = 0.5;
+    bool with_pores_ = true;
     double base_period_ = 5;
     double period_min_ = 4;
     double period_max_ = 7;
@@ -160,6 +179,8 @@ private:
     cv::Mat orientation_;
     cv::Mat period_;
     cv::Mat ridges_;
+    cv::Mat pores_;   // CV_8U, 255 where a pore was drawn (flipped with the hand)
+    cv::Mat height_;  // CV_32F relief in units of relief_mm: crest +0.5, furrow -0.5, crease down to -1.6 (editor profile), outside 0
     cv::Mat image_;
     std::vector<Stroke> strokes_;
 };

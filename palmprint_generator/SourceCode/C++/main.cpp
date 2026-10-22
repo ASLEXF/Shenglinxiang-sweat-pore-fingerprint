@@ -12,16 +12,29 @@ namespace {
 void show_help() {
     std::cout
         << "usage: palmprint -o <image> [-dpi <n>] [-seed <n>] [-population <name>] [-right] [-layers <dir>]\n"
+        << "                 [-height <png>] [-relief <mm>] [-ridge-scale <f>] [-crease-scale <f>]\n"
+        << "                 [-no-pores]\n"
         << "  -o <image>     final palmar image (jpg or png)\n"
         << "  -dpi <n>       pixels per inch (default 250). Below ~265 dpi ridges are drawn\n"
-        << "                 at 5 px and come out wider than life. Below ~420 dpi fingertip pores\n"
-        << "                 reach only about half the real density. Use 500 for pore work.\n"
+        << "                 at 5 px and come out wider than life. Below ~600 dpi fingertip pores\n"
+        << "                 reach only about half the real density. Use 1000 for pore work.\n"
         << "  -seed <n>      pattern seed (default 1)\n"
         << "  -population <name>  statistics to sample patterns and sizes from (default han):\n";
     for (const auto& p : kPopulations) std::cout << "                 " << p.name << ": " << p.note << "\n";
     std::cout
         << "  -right         mirror the left-hand model into a right hand\n"
-        << "  -layers <dir>  also write region, orientation, ridge and crease layers\n";
+        << "  -layers <dir>  also write region, orientation, ridge and crease layers\n"
+        << "  -ridge-scale <f>  multiply the ridge period (default 0.8, range 0.4-1.5); 1 is the\n"
+        << "                 preset's own period, lower gives finer, denser ridges. The 5 px\n"
+        << "                 floor still applies at low dpi.\n"
+        << "  -crease-scale <f>  multiply the width of all creases: palm lines, finger joints, wrist\n"
+        << "                 (default 0.5, range 0.2-1.5)\n"
+        << "  -dump-creases <json>  write the crease centre lines and outline as JSON (for the depth editor)\n"
+        << "  -no-pores      leave out the sweat pores (image and height map)\n"
+        << "  -height <png>  write a 16 bit grey height map for a 3D model (mid grey 32768 = flat)\n"
+        << "  -relief <mm>   ridge crest-to-furrow height the height map stands for (default 0.1,\n"
+        << "                 an art-direction value, not a measurement); only changes the mm\n"
+        << "                 figures printed, not the image\n";
 }
 
 }  // namespace
@@ -29,6 +42,12 @@ void show_help() {
 int main(int argc, char** argv) {
     std::string output;
     std::string layers;
+    std::string height;
+    double relief_mm = 0.1;
+    double ridge_scale = 0.8;
+    double crease_scale = 0.5;
+    bool pores = true;
+    std::string dump_creases;
     int dpi = 250;
     unsigned seed = 1;
     bool right = false;
@@ -74,6 +93,42 @@ int main(int argc, char** argv) {
             right = true;
         } else if (arg == "-layers") {
             layers = need("-layers");
+        } else if (arg == "-height") {
+            height = need("-height");
+        } else if (arg == "-crease-scale") {
+            const char* text = need("-crease-scale");
+            char* end = nullptr;
+            errno = 0;
+            const double f = std::strtod(text, &end);
+            if (end == text || *end != '\0' || errno == ERANGE || !(f >= 0.2 && f <= 1.5)) {
+                std::cerr << "crease-scale must be a number in [0.2, 1.5]: " << text << "\n";
+                return 1;
+            }
+            crease_scale = f;
+        } else if (arg == "-dump-creases") {
+            dump_creases = need("-dump-creases");
+        } else if (arg == "-no-pores") {
+            pores = false;
+        } else if (arg == "-ridge-scale") {
+            const char* text = need("-ridge-scale");
+            char* end = nullptr;
+            errno = 0;
+            const double f = std::strtod(text, &end);
+            if (end == text || *end != '\0' || errno == ERANGE || !(f >= 0.4 && f <= 1.5)) {
+                std::cerr << "ridge-scale must be a number in [0.4, 1.5]: " << text << "\n";
+                return 1;
+            }
+            ridge_scale = f;
+        } else if (arg == "-relief") {
+            const char* text = need("-relief");
+            char* end = nullptr;
+            errno = 0;
+            const double mm = std::strtod(text, &end);
+            if (end == text || *end != '\0' || errno == ERANGE || !(mm > 0.0 && mm <= 10.0)) {
+                std::cerr << "relief must be a number in (0, 10] mm: " << text << "\n";
+                return 1;
+            }
+            relief_mm = mm;
         } else {
             std::cerr << "unknown argument: " << arg << "\n";
             show_help();
@@ -94,6 +149,9 @@ int main(int argc, char** argv) {
 
     try {
         PalmPrint palm(dpi, seed, right, *population);
+        palm.set_ridge_scale(ridge_scale);
+        palm.set_crease_scale(crease_scale);
+        palm.set_pores(pores);
         palm.generate();
         if (!palm.save(output)) {
             std::cerr << "failed to write " << output << "\n";
@@ -102,6 +160,14 @@ int main(int argc, char** argv) {
         std::cout << "wrote " << output << "\n";
         if (!layers.empty() && !palm.save_layers(layers)) {
             std::cerr << "failed to write layers in " << layers << "\n";
+            return 1;
+        }
+        if (!dump_creases.empty() && !palm.dump_creases(dump_creases)) {
+            std::cerr << "failed to write " << dump_creases << "\n";
+            return 1;
+        }
+        if (!height.empty() && !palm.save_height(height, relief_mm)) {
+            std::cerr << "failed to write " << height << "\n";
             return 1;
         }
     } catch (const std::exception& e) {
